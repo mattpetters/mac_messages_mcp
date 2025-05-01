@@ -96,10 +96,26 @@ def query_messages_db(query: str, params: tuple = ()) -> List[Dict[str, Any]]:
 def normalize_phone_number(phone: str) -> str:
     """
     Normalize a phone number by removing all non-digit characters.
+    If it's a US number (10 digits) and doesn't have a country code,
+    prepend +1 to ensure proper iMessage delivery.
     """
     if not phone:
         return ""
-    return ''.join(c for c in phone if c.isdigit())
+        
+    # Remove all non-digit characters
+    digits = ''.join(c for c in phone if c.isdigit())
+    
+    # If it's a US 10-digit number without country code, add +1
+    if len(digits) == 10:
+        return f"+1{digits}"
+    # If it already has country code but no + prefix
+    elif len(digits) > 10 and not phone.startswith('+'):
+        return f"+{digits}"
+    # If it already has + prefix, keep original format
+    elif phone.startswith('+'):
+        return phone
+    else:
+        return digits
 
 # Global cache for contacts map
 _CONTACTS_CACHE = None
@@ -440,26 +456,47 @@ def send_message(recipient: str, message: str, group_chat: bool = False) -> str:
             
             # Get the selected contact
             contact = send_message.recent_matches[index]
-            return _send_message_to_recipient(contact['phone'], message, contact['name'], group_chat)
+            # Use the phone number directly instead of the contact name
+            formatted_number = normalize_phone_number(contact['phone'])
+            return _send_message_to_recipient(formatted_number, message, contact['name'], group_chat)
         except (ValueError, IndexError) as e:
             return f"Error selecting contact: {str(e)}"
     
-    # Check if recipient is directly a phone number
-    if all(c.isdigit() or c in '+- ()' for c in recipient):
-        # Clean the phone number
-        clean_number = ''.join(c for c in recipient if c.isdigit())
-        return _send_message_to_recipient(clean_number, message, group_chat=group_chat)
+    # Enhanced check for phone number format
+    # Check for common phone number patterns with better matching
+    is_phone_number = False
     
-    # Try to find the contact by name
+    # Check if it's a phone number with various formats
+    if (
+        # Basic digit check
+        all(c.isdigit() or c in '+- ().' for c in recipient) and 
+        # Has enough digits to be a phone number (at least 7)
+        sum(c.isdigit() for c in recipient) >= 7
+    ):
+        is_phone_number = True
+    
+    # If it looks like a phone number, use it directly
+    if is_phone_number:
+        # Normalize the phone number to proper format for iMessage
+        formatted_number = normalize_phone_number(recipient)
+        return _send_message_to_recipient(formatted_number, message, None, group_chat)
+    
+    # Check for email format
+    if '@' in recipient and '.' in recipient.split('@')[1]:
+        # It's likely an email address, use it directly
+        return _send_message_to_recipient(recipient, message, None, group_chat)
+    
+    # If we're here, try to find the contact by name (last resort)
     contacts = find_contact_by_name(recipient)
     
     if not contacts:
         return f"Error: Could not find any contact matching '{recipient}'"
     
     if len(contacts) == 1:
-        # Single match, use it
+        # Single match, use phone number directly
         contact = contacts[0]
-        return _send_message_to_recipient(contact['phone'], message, contact['name'], group_chat)
+        formatted_number = normalize_phone_number(contact['phone'])
+        return _send_message_to_recipient(formatted_number, message, contact['name'], group_chat)
     else:
         # Store the matches for later selection
         send_message.recent_matches = contacts
@@ -609,13 +646,28 @@ def get_recent_messages(hours: int = 24, contact: Optional[str] = None) -> str:
                 if index < 0 or index >= len(get_recent_messages.recent_matches):
                     return f"Invalid selection. Please choose a number between 1 and {len(get_recent_messages.recent_matches)}."
                 
-                # Get the selected contact's phone number
+                # Get the selected contact's phone number directly
                 contact = get_recent_messages.recent_matches[index]['phone']
             except (ValueError, IndexError) as e:
                 return f"Error selecting contact: {str(e)}"
         
-        # Check if contact might be a name rather than a phone number or email
-        if not all(c.isdigit() or c in '+- ()@.' for c in contact):
+        # Enhanced check for phone number format
+        is_phone_number = False
+        
+        # Check if it's a phone number with various formats
+        if (
+            # Basic digit check
+            all(c.isdigit() or c in '+- ().' for c in contact) and 
+            # Has enough digits to be a phone number (at least 7)
+            sum(c.isdigit() for c in contact) >= 7
+        ):
+            is_phone_number = True
+        
+        # Handle email addresses directly
+        is_email = '@' in contact and '.' in contact.split('@')[1]
+            
+        # Only do contact name lookup if it's not a phone number or email
+        if not is_phone_number and not is_email:
             # Try fuzzy matching
             matches = find_contact_by_name(contact)
             
@@ -623,7 +675,7 @@ def get_recent_messages(hours: int = 24, contact: Optional[str] = None) -> str:
                 return f"No contacts found matching '{contact}'."
             
             if len(matches) == 1:
-                # Single match, use its phone number
+                # Single match, use its phone number directly
                 contact = matches[0]['phone']
             else:
                 # Store the matches for later selection
@@ -633,9 +685,12 @@ def get_recent_messages(hours: int = 24, contact: Optional[str] = None) -> str:
                 contact_list = "\n".join([f"{i+1}. {c['name']} ({c['phone']})" for i, c in enumerate(matches[:10])])
                 return f"Multiple contacts found matching '{contact}'. Please specify which one using 'contact:N' where N is the number:\n{contact_list}"
         
-        # At this point, contact should be a phone number or email
+        # Now contact should be a phone number or email - normalize it
+        if is_phone_number:
+            contact = normalize_phone_number(contact)
+        
         # Try to find handle_id with improved phone number matching
-        if '@' in contact:
+        if is_email:
             # This is an email
             query = "SELECT ROWID FROM handle WHERE id = ?"
             results = query_messages_db(query, (contact,))
@@ -647,7 +702,7 @@ def get_recent_messages(hours: int = 24, contact: Optional[str] = None) -> str:
             
         if not handle_id:
             # Try a direct search in message table to see if any messages exist
-            normalized = normalize_phone_number(contact)
+            normalized = normalize_phone_number(contact) if is_phone_number else contact
             query = """
             SELECT COUNT(*) as count 
             FROM message m
@@ -785,6 +840,9 @@ def _send_message_direct(recipient: str, message: str, contact_name: str = None,
             set targetService to 1st service whose service type = iMessage
             
             try
+                -- Activate Messages to ensure it's in the foreground
+                activate
+                
                 -- Try to get the existing buddy if possible
                 set targetBuddy to buddy "{safe_recipient}" of targetService
                 
@@ -792,14 +850,22 @@ def _send_message_direct(recipient: str, message: str, contact_name: str = None,
                 send "{safe_message}" to targetBuddy
                 
                 -- Wait briefly to check for immediate errors
-                delay 1
+                delay 2
                 
                 -- Return success
                 return "success"
             on error errMsg
                 -- If getting buddy fails, try to create a new conversation
                 try
-                    set newMessage to send "{safe_message}" to "{safe_recipient}"
+                    -- Make sure recipient is in the correct format
+                    set formattedRecipient to "{safe_recipient}"
+                    
+                    -- Try alternative sending method
+                    set newMessage to send "{safe_message}" to formattedRecipient
+                    
+                    -- Wait a bit longer to ensure delivery attempt
+                    delay 2
+                    
                     return "success"
                 on error errMsg2
                     -- Both methods failed
@@ -812,6 +878,9 @@ def _send_message_direct(recipient: str, message: str, contact_name: str = None,
         script = f'''
         tell application "Messages"
             try
+                -- Activate Messages to ensure it's in the foreground
+                activate
+                
                 -- Try to get the existing chat
                 set targetChat to chat "{safe_recipient}"
                 
@@ -819,7 +888,7 @@ def _send_message_direct(recipient: str, message: str, contact_name: str = None,
                 send "{safe_message}" to targetChat
                 
                 -- Wait briefly to check for immediate errors
-                delay 1
+                delay 2
                 
                 -- Return success
                 return "success"
@@ -833,12 +902,12 @@ def _send_message_direct(recipient: str, message: str, contact_name: str = None,
     try:
         result = run_applescript(script)
         if result.startswith("error:"):
-            return f"Error sending message: {result[6:]}"
+            return f"Error sending message: {result[6:]}. Please check that the recipient number/email is correct and Messages app is properly set up."
         elif result.strip() == "success":
             display_name = contact_name if contact_name else recipient
-            return f"Message sent successfully to {display_name}"
+            return f"Message sent successfully to {display_name}. Note: A 'Not Delivered' status may appear if there are network issues or if the recipient is not registered with iMessage."
         else:
-            return f"Unknown result: {result}"
+            return f"Unknown result: {result}. Message may still be in sending state; please check Messages app for status."
     except Exception as e:
         return f"Error sending message: {str(e)}"
     
@@ -907,34 +976,65 @@ def find_handle_by_phone(phone: str) -> Optional[int]:
     if not normalized:
         return None
     
-    # Try various formats for US numbers
-    formats_to_try = [normalized]  # Start with the normalized input
+    # Try various formats for numbers
+    formats_to_try = []
     
-    # For US numbers, try with and without country code
-    if normalized.startswith('1') and len(normalized) > 10:
-        # Try without the country code
+    # Add the original normalized format (with + if it exists)
+    formats_to_try.append(normalized)
+    
+    # For numbers with country code, try with and without it
+    if normalized.startswith('+'):
+        # Remove the + but keep the country code
         formats_to_try.append(normalized[1:])
+        
+        # For US/Canada numbers (+1), also try without country code
+        if normalized.startswith('+1') and len(normalized) > 10:
+            formats_to_try.append(normalized[2:])
+    
+    # If it doesn't have a + but appears to have a country code
+    elif len(normalized) > 10:
+        # Add version with +
+        formats_to_try.append('+' + normalized)
+        
+        # For US/Canada numbers, try without country code
+        if normalized.startswith('1') and len(normalized) > 10:
+            formats_to_try.append(normalized[1:])
+    
+    # If it's a standard 10-digit number (US/Canada)
     elif len(normalized) == 10:
-        # Try with the country code
+        # Try with country code +1
+        formats_to_try.append('+1' + normalized)
         formats_to_try.append('1' + normalized)
     
-    # Query for the handle ID using OR conditions
+    # Remove duplicates
+    formats_to_try = list(set(formats_to_try))
+    
+    # Prepare query placeholders
     placeholders = ', '.join(['?' for _ in formats_to_try])
+    
+    # First try direct matches
     query = f"""
     SELECT ROWID FROM handle 
     WHERE id IN ({placeholders})
-    OR id IN ({placeholders})
     """
     
-    # Create parameters list with both the raw formats and with "+" prefix
-    params = formats_to_try + ['+' + f for f in formats_to_try]
+    results = query_messages_db(query, tuple(formats_to_try))
     
-    results = query_messages_db(query, tuple(params))
+    if results and not "error" in results[0] and len(results) > 0:
+        return results[0]["ROWID"]
     
-    if not results or "error" in results[0]:
-        return None
+    # If no exact match, try LIKE matches with wildcards
+    placeholders = ', '.join(['?' for _ in formats_to_try])
+    like_params = [f"%{f}%" for f in formats_to_try]
     
-    if len(results) == 0:
+    query = f"""
+    SELECT ROWID FROM handle 
+    WHERE {' OR '.join([f'id LIKE ?' for _ in formats_to_try])}
+    """
+    
+    results = query_messages_db(query, tuple(like_params))
+    
+    if not results or "error" in results[0] or len(results) == 0:
         return None
     
     return results[0]["ROWID"]
@@ -1017,3 +1117,751 @@ def check_addressbook_access() -> str:
         return "\n".join(status)
     except Exception as e:
         return f"ERROR: Unexpected error during database access check: {str(e)} PLEASE TELL THE USER TO GRANT FULL DISK ACCESS TO THE TERMINAL APPLICATION(CURSOR, TERMINAL, CLAUDE, ETC.) AND RESTART THE APPLICATION. DO NOT RETRY UNTIL NEXT MESSAGE."
+
+def get_unread_messages() -> str:
+    """
+    Get all unread messages from the Messages app.
+    
+    Returns:
+        Formatted string with unread messages, including sender, timestamp, and content
+    """
+    # Build the SQL query - use is_read=0 to filter for unread messages
+    query = """
+    SELECT 
+        m.ROWID,
+        m.date, 
+        m.text, 
+        m.attributedBody,
+        m.is_from_me,
+        m.handle_id,
+        m.cache_roomnames
+    FROM 
+        message m
+    WHERE 
+        m.is_read = 0
+        AND m.is_from_me = 0
+    ORDER BY m.date ASC
+    """
+    
+    # Execute the query
+    messages = query_messages_db(query)
+    
+    # Format the results
+    if not messages:
+        return "No unread messages found."
+    
+    if "error" in messages[0]:
+        return f"Error accessing messages: {messages[0]['error']}"
+    
+    # Get chat mapping for group chat names
+    chat_mapping = get_chat_mapping()
+    
+    formatted_messages = []
+    for msg in messages:
+        # Get the message content from text or attributedBody
+        if msg.get('text'):
+            body = msg['text']
+        elif msg.get('attributedBody'):
+            body = extract_body_from_attributed(msg['attributedBody'])
+            if not body:
+                # Skip messages with no content
+                continue
+        else:
+            # Skip empty messages
+            continue
+        
+        # Convert Apple timestamp to readable date
+        try:
+            # Convert Apple timestamp to datetime
+            date_string = '2001-01-01'
+            mod_date = datetime.strptime(date_string, '%Y-%m-%d')
+            unix_timestamp = int(mod_date.timestamp()) * 1000000000
+            
+            # Handle both nanosecond and second format timestamps
+            msg_timestamp = int(msg["date"])
+            if len(str(msg_timestamp)) > 10:  # It's in nanoseconds
+                new_date = int((msg_timestamp + unix_timestamp) / 1000000000)
+            else:  # It's already in seconds
+                new_date = mod_date.timestamp() + msg_timestamp
+                
+            date_str = datetime.fromtimestamp(new_date).strftime("%Y-%m-%d %H:%M:%S")
+        except (ValueError, TypeError, OverflowError) as e:
+            # If conversion fails, use a placeholder
+            date_str = "Unknown date"
+            msg_datetime = datetime.now()  # Fallback for sorting
+            print(f"Date conversion error: {e} for timestamp {msg['date']}")
+        
+        sender = get_contact_name(msg["handle_id"])
+        
+        # Check if this is a group chat
+        group_chat_name = None
+        if msg.get('cache_roomnames'):
+            group_chat_name = chat_mapping.get(msg['cache_roomnames'])
+        
+        message_prefix = f"[{date_str}]"
+        if group_chat_name:
+            message_prefix += f" [{group_chat_name}]"
+        
+        formatted_messages.append(
+            f"{message_prefix} {sender}: {body}"
+        )
+    
+    if not formatted_messages:
+        return "No unread messages found."
+        
+    return "\n".join(formatted_messages)
+
+def analyze_response_times(hours: int = 168, contact: Optional[str] = None) -> str:
+    """
+    Analyze response time patterns between you and your contacts.
+    
+    Args:
+        hours: Number of hours to look back (default: 168, which is 1 week)
+        contact: Optional specific contact to analyze
+        
+    Returns:
+        Formatted string with response time analysis
+    """
+    handle_id = None
+    
+    # If contact is specified, try to resolve it (similar to get_recent_messages)
+    if contact:
+        # Logic to find handle_id (simplified for brevity)
+        if '@' in contact:
+            query = "SELECT ROWID FROM handle WHERE id = ?"
+            results = query_messages_db(query, (contact,))
+            if results and not "error" in results[0] and len(results) > 0:
+                handle_id = results[0]["ROWID"]
+        else:
+            handle_id = find_handle_by_phone(contact)
+    
+    # Calculate the timestamp for X hours ago
+    current_time = datetime.now(timezone.utc)
+    hours_ago = current_time - timedelta(hours=hours)
+    
+    # Convert to Apple's timestamp format (seconds since 2001-01-01)
+    apple_epoch = datetime(2001, 1, 1, tzinfo=timezone.utc)
+    seconds_since_apple_epoch = int((hours_ago - apple_epoch).total_seconds())
+    timestamp_str = str(seconds_since_apple_epoch)
+    
+    # Build the SQL query
+    query = """
+    SELECT 
+        m.ROWID,
+        m.date, 
+        m.is_from_me,
+        m.handle_id,
+        m.date_read,
+        h.id as contact_id,
+        c.display_name as chat_name
+    FROM 
+        message m
+    JOIN 
+        handle h ON m.handle_id = h.ROWID
+    LEFT JOIN 
+        chat_handle_join chj ON h.ROWID = chj.handle_id
+    LEFT JOIN 
+        chat c ON chj.chat_id = c.ROWID
+    WHERE 
+        CAST(m.date AS TEXT) > ? 
+    """
+    
+    params = (timestamp_str,)
+    
+    # Add contact filter if handle_id was found
+    if handle_id:
+        query += "AND m.handle_id = ? "
+        params = (timestamp_str, handle_id)
+    
+    query += "ORDER BY h.id, m.date ASC"
+    
+    # Execute the query
+    messages = query_messages_db(query, params)
+    
+    if not messages:
+        return "No messages found in the specified time period."
+    
+    if "error" in messages[0]:
+        return f"Error accessing messages: {messages[0]['error']}"
+    
+    # Process messages by conversation
+    conversations = {}
+    contacts = get_cached_contacts()
+    
+    for msg in messages:
+        contact_id = msg.get('contact_id', 'unknown')
+        
+        # Skip system messages or corrupted entries
+        if not contact_id or contact_id == 'unknown':
+            continue
+            
+        # Initialize conversation if not seen before
+        if contact_id not in conversations:
+            # Try to get contact name
+            normalized = normalize_phone_number(contact_id)
+            contact_name = "Unknown"
+            
+            # Try different variations of the number for matching
+            if normalized in contacts:
+                contact_name = contacts[normalized]
+            elif normalized.startswith('1') and len(normalized) > 10 and normalized[1:] in contacts:
+                contact_name = contacts[normalized[1:]]
+            elif len(normalized) == 10 and '1' + normalized in contacts:
+                contact_name = contacts['1' + normalized]
+            else:
+                # Use display name from chat if available
+                chat_name = msg.get('chat_name')
+                if chat_name:
+                    contact_name = chat_name
+                else:
+                    contact_name = contact_id
+            
+            conversations[contact_id] = {
+                'name': contact_name,
+                'messages': [],
+                'your_response_times': [],
+                'their_response_times': [],
+            }
+        
+        # Add message to conversation with converted timestamp
+        try:
+            # Convert Apple timestamp to datetime
+            msg_timestamp = int(msg["date"])
+            mod_date = datetime.strptime('2001-01-01', '%Y-%m-%d')
+            
+            if len(str(msg_timestamp)) > 10:  # It's in nanoseconds
+                unix_timestamp = int(mod_date.timestamp()) * 1000000000
+                new_date = int((msg_timestamp + unix_timestamp) / 1000000000)
+                msg_datetime = datetime.fromtimestamp(new_date)
+            else:  # It's already in seconds
+                msg_datetime = mod_date + timedelta(seconds=msg_timestamp)
+            
+            conversations[contact_id]['messages'].append({
+                'timestamp': msg_datetime,
+                'is_from_me': msg['is_from_me'],
+                'date_read': msg.get('date_read', 0)
+            })
+        except (ValueError, TypeError, OverflowError) as e:
+            # Skip messages with invalid timestamps
+            print(f"Timestamp conversion error: {e} for message {msg['ROWID']}")
+            continue
+    
+    # Calculate response times for each conversation
+    for contact_id, conversation in conversations.items():
+        messages = conversation['messages']
+        
+        # Need at least 2 messages to calculate response time
+        if len(messages) < 2:
+            continue
+            
+        # Sort by timestamp (should already be sorted, but just in case)
+        messages.sort(key=lambda x: x['timestamp'])
+        
+        # Calculate response times
+        for i in range(1, len(messages)):
+            current_msg = messages[i]
+            prev_msg = messages[i-1]
+            
+            # Skip if same sender (not a response)
+            if current_msg['is_from_me'] == prev_msg['is_from_me']:
+                continue
+                
+            # Calculate response time in seconds
+            response_time = (current_msg['timestamp'] - prev_msg['timestamp']).total_seconds()
+            
+            # Add to appropriate list
+            if current_msg['is_from_me']:
+                # You responded to them
+                conversation['your_response_times'].append(response_time)
+            else:
+                # They responded to you
+                conversation['their_response_times'].append(response_time)
+    
+    # Format the results
+    results = []
+    results.append(f"Response Time Analysis (Past {hours} hours)")
+    results.append("=" * 50)
+    
+    # Sort conversations by total message count
+    sorted_conversations = sorted(
+        conversations.items(),
+        key=lambda x: len(x[1]['messages']), 
+        reverse=True
+    )
+    
+    for contact_id, convo in sorted_conversations:
+        your_times = convo['your_response_times']
+        their_times = convo['their_response_times']
+        
+        # Skip conversations with no response data
+        if not your_times and not their_times:
+            continue
+            
+        results.append(f"\n## {convo['name']} ({contact_id})")
+        results.append(f"Total messages: {len(convo['messages'])}")
+        
+        if your_times:
+            avg_your_time = sum(your_times) / len(your_times)
+            results.append(f"Your average response time: {format_duration(avg_your_time)}")
+            if len(your_times) > 1:
+                fastest = min(your_times)
+                slowest = max(your_times)
+                results.append(f"Your fastest response: {format_duration(fastest)}")
+                results.append(f"Your slowest response: {format_duration(slowest)}")
+        else:
+            results.append("No responses from you in this time period")
+            
+        if their_times:
+            avg_their_time = sum(their_times) / len(their_times)
+            results.append(f"Their average response time: {format_duration(avg_their_time)}")
+            if len(their_times) > 1:
+                fastest = min(their_times)
+                slowest = max(their_times)
+                results.append(f"Their fastest response: {format_duration(fastest)}")
+                results.append(f"Their slowest response: {format_duration(slowest)}")
+        else:
+            results.append("No responses from them in this time period")
+        
+        # Compare response times if both exist
+        if your_times and their_times:
+            avg_your = sum(your_times) / len(your_times)
+            avg_their = sum(their_times) / len(their_times)
+            
+            if avg_your < avg_their:
+                results.append(f"You respond {format_duration(avg_their - avg_your)} faster on average")
+            else:
+                results.append(f"They respond {format_duration(avg_your - avg_their)} faster on average")
+    
+    if len(results) <= 2:
+        return "No response pattern data found for the specified time period."
+        
+    return "\n".join(results)
+
+def format_duration(seconds: float) -> str:
+    """Format a duration in seconds to a human-readable string."""
+    if seconds < 60:
+        return f"{int(seconds)} seconds"
+    elif seconds < 3600:
+        return f"{int(seconds / 60)} minutes"
+    elif seconds < 86400:
+        hours = int(seconds / 3600)
+        minutes = int((seconds % 3600) / 60)
+        return f"{hours} hours, {minutes} minutes"
+    else:
+        days = int(seconds / 86400)
+        hours = int((seconds % 86400) / 3600)
+        return f"{days} days, {hours} hours"
+
+def get_unread_messages_detailed() -> str:
+    """
+    Get a detailed analysis of unread messages, grouped by conversation.
+    
+    Returns:
+        Formatted string with unread message analysis by conversation
+    """
+    # Query to get unread messages with additional context
+    query = """
+    SELECT 
+        m.ROWID,
+        m.text, 
+        m.attributedBody,
+        m.date,
+        m.handle_id,
+        m.cache_roomnames,
+        m.has_unseen_mention,
+        h.id as contact_id,
+        c.display_name as chat_name
+    FROM 
+        message m
+    JOIN 
+        handle h ON m.handle_id = h.ROWID
+    LEFT JOIN 
+        chat_handle_join chj ON h.ROWID = chj.handle_id
+    LEFT JOIN 
+        chat c ON chj.chat_id = c.ROWID
+    WHERE 
+        m.is_read = 0
+        AND m.is_from_me = 0
+    ORDER BY 
+        h.id, m.date ASC
+    """
+    
+    # Execute the query
+    messages = query_messages_db(query)
+    
+    # Format the results
+    if not messages:
+        return "No unread messages found."
+    
+    if "error" in messages[0]:
+        return f"Error accessing messages: {messages[0]['error']}"
+    
+    # Group messages by conversation
+    conversations = {}
+    chat_mapping = get_chat_mapping()
+    contacts = get_cached_contacts()
+    
+    for msg in messages:
+        # Extract message details
+        contact_id = msg.get('contact_id', 'unknown')
+        
+        # Skip system messages or corrupted entries
+        if not contact_id or contact_id == 'unknown':
+            continue
+        
+        # Get message content
+        if msg.get('text'):
+            body = msg['text']
+        elif msg.get('attributedBody'):
+            body = extract_body_from_attributed(msg['attributedBody'])
+            if not body:
+                # Skip messages with no content
+                continue
+        else:
+            # Skip empty messages
+            continue
+        
+        # Convert timestamp
+        try:
+            # Convert Apple timestamp to datetime
+            date_string = '2001-01-01'
+            mod_date = datetime.strptime(date_string, '%Y-%m-%d')
+            unix_timestamp = int(mod_date.timestamp()) * 1000000000
+            
+            # Handle both nanosecond and second format timestamps
+            msg_timestamp = int(msg["date"])
+            if len(str(msg_timestamp)) > 10:  # It's in nanoseconds
+                new_date = int((msg_timestamp + unix_timestamp) / 1000000000)
+            else:  # It's already in seconds
+                new_date = mod_date.timestamp() + msg_timestamp
+                
+            msg_datetime = datetime.fromtimestamp(new_date)
+            date_str = msg_datetime.strftime("%Y-%m-%d %H:%M:%S")
+        except (ValueError, TypeError, OverflowError) as e:
+            # If conversion fails, use a placeholder
+            date_str = "Unknown date"
+            msg_datetime = datetime.now()  # Fallback for sorting
+            print(f"Date conversion error: {e} for timestamp {msg['date']}")
+        
+        # Get sender name or group chat name
+        chat_name = None
+        if msg.get('cache_roomnames'):
+            chat_name = chat_mapping.get(msg.get('cache_roomnames'))
+        
+        # Try to get contact name
+        normalized = normalize_phone_number(contact_id)
+        contact_name = "Unknown"
+        
+        # Try different variations of the number for matching
+        if normalized in contacts:
+            contact_name = contacts[normalized]
+        elif normalized.startswith('1') and len(normalized) > 10 and normalized[1:] in contacts:
+            contact_name = contacts[normalized[1:]]
+        elif len(normalized) == 10 and '1' + normalized in contacts:
+            contact_name = contacts['1' + normalized]
+        else:
+            # Use display name from chat if available
+            if msg.get('chat_name'):
+                contact_name = msg.get('chat_name')
+            else:
+                contact_name = contact_id
+        
+        # Key for grouping: use group chat name if available, otherwise use contact
+        conversation_key = chat_name if chat_name else contact_id
+        
+        # Initialize conversation if not seen before
+        if conversation_key not in conversations:
+            conversations[conversation_key] = {
+                'name': chat_name if chat_name else contact_name,
+                'is_group': chat_name is not None,
+                'messages': [],
+                'mentions': 0,
+                'latest_timestamp': msg_datetime,
+                'earliest_timestamp': msg_datetime
+            }
+        
+        # Add message to conversation
+        conversations[conversation_key]['messages'].append({
+            'body': body,
+            'date': date_str,
+            'sender': contact_name if chat_name else contact_name,
+            'has_mention': msg.get('has_unseen_mention', 0) == 1
+        })
+        
+        # Update conversation metadata
+        if msg.get('has_unseen_mention', 0) == 1:
+            conversations[conversation_key]['mentions'] += 1
+            
+        # Update timestamps
+        if msg_datetime > conversations[conversation_key]['latest_timestamp']:
+            conversations[conversation_key]['latest_timestamp'] = msg_datetime
+            
+        if msg_datetime < conversations[conversation_key]['earliest_timestamp']:
+            conversations[conversation_key]['earliest_timestamp'] = msg_datetime
+    
+    # Sort conversations by priority:
+    # 1. Mentions first
+    # 2. Then by recency (latest message)
+    sorted_conversations = sorted(
+        conversations.items(),
+        key=lambda x: (-x[1]['mentions'], -int(x[1]['latest_timestamp'].timestamp()))
+    )
+    
+    # Format the results
+    results = []
+    total_unread = sum(len(c['messages']) for _, c in sorted_conversations)
+    results.append(f"Unread Messages Analysis: {total_unread} total unread messages")
+    results.append("=" * 50)
+    
+    for key, convo in sorted_conversations:
+        is_group = convo['is_group']
+        message_count = len(convo['messages'])
+        mention_count = convo['mentions']
+        
+        # Calculate time since first unread message
+        time_since = datetime.now() - convo['earliest_timestamp']
+        days_since = time_since.days
+        hours_since = time_since.seconds // 3600
+        
+        # Format header with priority indicators
+        header = f"\n## {convo['name']}"
+        if mention_count > 0:
+            header += f" [⚠️ {mention_count} mention{'s' if mention_count > 1 else ''}]"
+        if days_since > 0:
+            header += f" [{days_since}d {hours_since}h old]"
+        else:
+            header += f" [{hours_since}h old]"
+            
+        results.append(header)
+        results.append(f"{message_count} unread message{'s' if message_count > 1 else ''} in {'group chat' if is_group else 'conversation'}")
+        
+        # Add message previews (limit to 5 for readability)
+        results.append("\nRecent messages:")
+        for msg in convo['messages'][-5:]:
+            mention_indicator = " [@mentioned]" if msg['has_mention'] else ""
+            if is_group:
+                results.append(f"[{msg['date']}] {msg['sender']}: {msg['body']}{mention_indicator}")
+            else:
+                results.append(f"[{msg['date']}] {msg['body']}{mention_indicator}")
+    
+    if not results:
+        return "No unread messages found."
+        
+    return "\n".join(results)
+
+def find_action_items(hours: int = 72) -> str:
+    """
+    Scan messages for action items and commitments made by the user.
+    
+    Looks for phrases that indicate the user has committed to doing something
+    and organizes these by recipient.
+    
+    Args:
+        hours: Number of hours to look back (default: 72)
+        
+    Returns:
+        Formatted string with action items grouped by recipient
+    """
+    # Calculate the timestamp for X hours ago
+    current_time = datetime.now(timezone.utc)
+    hours_ago = current_time - timedelta(hours=hours)
+    
+    # Convert to Apple's timestamp format (seconds since 2001-01-01)
+    apple_epoch = datetime(2001, 1, 1, tzinfo=timezone.utc)
+    seconds_since_apple_epoch = int((hours_ago - apple_epoch).total_seconds())
+    timestamp_str = str(seconds_since_apple_epoch)
+    
+    # Build the SQL query - only get messages sent by user
+    query = """
+    SELECT 
+        m.ROWID,
+        m.date, 
+        m.text, 
+        m.attributedBody,
+        m.handle_id,
+        m.cache_roomnames,
+        h.id as contact_id,
+        c.display_name as chat_name
+    FROM 
+        message m
+    JOIN 
+        handle h ON m.handle_id = h.ROWID
+    LEFT JOIN 
+        chat_handle_join chj ON h.ROWID = chj.handle_id
+    LEFT JOIN 
+        chat c ON chj.chat_id = c.ROWID
+    WHERE 
+        CAST(m.date AS TEXT) > ? 
+        AND m.is_from_me = 1
+    ORDER BY 
+        h.id, m.date ASC
+    """
+    
+    # Execute the query
+    messages = query_messages_db(query, (timestamp_str,))
+    
+    if not messages:
+        return "No messages found in the specified time period."
+    
+    if "error" in messages[0]:
+        return f"Error accessing messages: {messages[0]['error']}"
+    
+    # Patterns that indicate commitments or action items
+    commitment_patterns = [
+        r"I'?ll\s+(?:try\s+to\s+)?([^.,;!?]*)",
+        r"I\s+will\s+(?:try\s+to\s+)?([^.,;!?]*)",
+        r"I\s+can\s+(?:try\s+to\s+)?([^.,;!?]*)",
+        r"let\s+me\s+([^.,;!?]*)",
+        r"I\s+should\s+(?:probably\s+)?([^.,;!?]*)",
+        r"I'm\s+going\s+to\s+([^.,;!?]*)",
+        r"I\s+promise\s+(?:to\s+)?([^.,;!?]*)",
+        r"I\s+need\s+to\s+([^.,;!?]*)",
+        r"I\s+owe\s+you\s+([^.,;!?]*)",
+        r"remind\s+me\s+to\s+([^.,;!?]*)",
+        r"I\s+have\s+to\s+([^.,;!?]*)",
+        r"I\s+must\s+([^.,;!?]*)",
+        r"I'?m\s+supposed\s+to\s+([^.,;!?]*)",
+        r"I\s+said\s+I'?(?:d|ll)\s+([^.,;!?]*)",
+        r"won'?t\s+forget\s+to\s+([^.,;!?]*)",
+    ]
+    
+    # Group messages by conversation
+    conversations = {}
+    chat_mapping = get_chat_mapping()
+    contacts = get_cached_contacts()
+    
+    for msg in messages:
+        # Extract message details
+        contact_id = msg.get('contact_id', 'unknown')
+        
+        # Skip system messages or corrupted entries
+        if not contact_id or contact_id == 'unknown':
+            continue
+        
+        # Get message content
+        if msg.get('text'):
+            body = msg['text']
+        elif msg.get('attributedBody'):
+            body = extract_body_from_attributed(msg['attributedBody'])
+            if not body:
+                # Skip messages with no content
+                continue
+        else:
+            # Skip empty messages
+            continue
+        
+        # Convert timestamp
+        try:
+            # Convert Apple timestamp to datetime
+            date_string = '2001-01-01'
+            mod_date = datetime.strptime(date_string, '%Y-%m-%d')
+            unix_timestamp = int(mod_date.timestamp()) * 1000000000
+            
+            # Handle both nanosecond and second format timestamps
+            msg_timestamp = int(msg["date"])
+            if len(str(msg_timestamp)) > 10:  # It's in nanoseconds
+                new_date = int((msg_timestamp + unix_timestamp) / 1000000000)
+            else:  # It's already in seconds
+                new_date = mod_date.timestamp() + msg_timestamp
+                
+            msg_datetime = datetime.fromtimestamp(new_date)
+            date_str = msg_datetime.strftime("%Y-%m-%d %H:%M:%S")
+        except (ValueError, TypeError, OverflowError) as e:
+            # If conversion fails, use a placeholder
+            date_str = "Unknown date"
+            msg_datetime = datetime.now()  # Fallback for sorting
+            print(f"Date conversion error: {e} for timestamp {msg['date']}")
+        
+        # Get chat name or group chat name
+        chat_name = None
+        if msg.get('cache_roomnames'):
+            chat_name = chat_mapping.get(msg.get('cache_roomnames'))
+        
+        # Try to get contact name
+        normalized = normalize_phone_number(contact_id)
+        contact_name = "Unknown"
+        
+        # Try different variations of the number for matching
+        if normalized in contacts:
+            contact_name = contacts[normalized]
+        elif normalized.startswith('1') and len(normalized) > 10 and normalized[1:] in contacts:
+            contact_name = contacts[normalized[1:]]
+        elif len(normalized) == 10 and '1' + normalized in contacts:
+            contact_name = contacts['1' + normalized]
+        else:
+            # Use display name from chat if available
+            if msg.get('chat_name'):
+                contact_name = msg.get('chat_name')
+            else:
+                contact_name = contact_id
+        
+        # Key for grouping: use group chat name if available, otherwise use contact
+        conversation_key = chat_name if chat_name else contact_id
+        
+        # Initialize conversation if not seen before
+        if conversation_key not in conversations:
+            conversations[conversation_key] = {
+                'name': chat_name if chat_name else contact_name,
+                'is_group': chat_name is not None,
+                'action_items': []
+            }
+        
+        # Look for commitment patterns in the message
+        for pattern in commitment_patterns:
+            matches = re.finditer(pattern, body, re.IGNORECASE)
+            for match in matches:
+                action_item = match.group(1).strip()
+                # Skip if empty or too short (likely false positive)
+                if len(action_item) < 3:
+                    continue
+                    
+                # Add context by including the surrounding text
+                context = body
+                if len(context) > 100:
+                    # Truncate for readability but keep relevant part
+                    start = max(0, match.start() - 50)
+                    end = min(len(body), match.end() + 50)
+                    context = "..." + body[start:end] + "..." if start > 0 else body[start:end] + "..."
+                
+                conversations[conversation_key]['action_items'].append({
+                    'action': action_item,
+                    'context': context,
+                    'date': date_str,
+                    'timestamp': msg_datetime
+                })
+    
+    # Format the results
+    results = []
+    total_actions = sum(len(c['action_items']) for _, c in conversations.items())
+    
+    results.append(f"Action Items and Commitments (Past {hours} hours)")
+    results.append("=" * 50)
+    
+    if total_actions == 0:
+        results.append("\nNo action items or commitments found in your recent messages.")
+        return "\n".join(results)
+    
+    results.append(f"\nFound {total_actions} potential action items across {len(conversations)} conversations.")
+    
+    # Sort conversations by most recent action item
+    sorted_conversations = sorted(
+        [(k, v) for k, v in conversations.items() if v['action_items']],
+        key=lambda x: max(item['timestamp'] for item in x[1]['action_items']),
+        reverse=True
+    )
+    
+    for key, convo in sorted_conversations:
+        if not convo['action_items']:
+            continue
+            
+        results.append(f"\n## {convo['name']}")
+        
+        # Sort action items by date (newest first)
+        sorted_items = sorted(convo['action_items'], key=lambda x: x['timestamp'], reverse=True)
+        
+        for item in sorted_items:
+            results.append(f"- [{item['date']}] {item['action']}")
+            results.append(f"  Context: \"{item['context']}\"")
+            results.append("")
+    
+    return "\n".join(results)

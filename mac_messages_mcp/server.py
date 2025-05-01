@@ -13,7 +13,11 @@ from mac_messages_mcp.messages import (
     check_messages_db_access,
     get_cached_contacts,
     check_addressbook_access,
-    query_messages_db
+    query_messages_db,
+    get_unread_messages,
+    analyze_response_times,
+    get_unread_messages_detailed,
+    find_action_items
 )
 
 # Configure logging to stderr for debugging
@@ -186,6 +190,136 @@ def tool_get_chats(ctx: Context) -> str:
         logger.error(f"Error getting chats: {str(e)}")
         return f"Error getting chats: {str(e)}"
 
+@mcp.tool()
+def tool_get_unread_messages(ctx: Context) -> str:
+    """
+    Get all unread messages from the Messages app.
+    
+    This tool retrieves all messages that have not been read yet, showing
+    who they are from, when they were received, and the message content.
+    Useful for ensuring no messages are neglected or lost track of.
+    """
+    logger.info("Getting unread messages")
+    try:
+        result = get_unread_messages()
+        return result
+    except Exception as e:
+        logger.error(f"Error getting unread messages: {str(e)}")
+        return f"Error getting unread messages: {str(e)}"
+
+@mcp.tool()
+def tool_query_messages_db(ctx: Context, query: str) -> str:
+    """
+    Run a custom SQL query against the Messages database.
+    
+    This advanced tool allows running arbitrary SQL queries for exploring
+    the database schema and extracting specific information.
+    
+    Args:
+        query: SQL query to execute against the Messages database
+    """
+    logger.info(f"Running custom SQL query: {query}")
+    try:
+        results = query_messages_db(query)
+        
+        if not results:
+            return "Query returned no results."
+        
+        if "error" in results[0]:
+            return f"Error executing query: {results[0]['error']}"
+        
+        # Format results as a readable string
+        formatted_results = []
+        
+        # Get column names from first result
+        columns = list(results[0].keys())
+        header = " | ".join(columns)
+        separator = "-" * len(header)
+        
+        formatted_results.append(header)
+        formatted_results.append(separator)
+        
+        # Add rows
+        for row in results:
+            formatted_row = " | ".join(str(row.get(col, "NULL")) for col in columns)
+            formatted_results.append(formatted_row)
+        
+        return "\n".join(formatted_results)
+    except Exception as e:
+        logger.error(f"Error in query_messages_db: {str(e)}")
+        return f"Error executing query: {str(e)}"
+
+@mcp.tool()
+def tool_analyze_response_times(ctx: Context, hours: int = 168, contact: str = None) -> str:
+    """
+    Analyze response time patterns between you and your contacts.
+    
+    This tool provides insights into how quickly you respond to messages
+    compared to how quickly others respond to you, helping identify
+    communication patterns and potential areas for improvement.
+    
+    Args:
+        hours: Number of hours to look back (default: 168, which is 1 week)
+        contact: Filter by contact name, phone number, or email (optional)
+                Use "contact:N" to select a specific contact from previous matches
+    """
+    logger.info(f"Analyzing response times: hours={hours}, contact={contact}")
+    try:
+        # Handle contacts that are passed as numbers
+        if contact is not None:
+            contact = str(contact)
+        result = analyze_response_times(hours=hours, contact=contact)
+        return result
+    except Exception as e:
+        logger.error(f"Error analyzing response times: {str(e)}")
+        return f"Error analyzing response times: {str(e)}"
+
+@mcp.tool()
+def tool_get_unread_messages_detailed(ctx: Context) -> str:
+    """
+    Get a detailed analysis of unread messages, grouped by conversation.
+    
+    This tool provides a more comprehensive view of unread messages than
+    the standard unread messages tool, including:
+    - Grouping by conversation
+    - Highlighting mentions
+    - Showing message age
+    - Prioritizing conversations that need attention
+    
+    Useful for managing communications and ensuring important messages
+    aren't overlooked.
+    """
+    logger.info("Getting detailed unread messages analysis")
+    try:
+        result = get_unread_messages_detailed()
+        return result
+    except Exception as e:
+        logger.error(f"Error getting detailed unread messages: {str(e)}")
+        return f"Error getting detailed unread messages: {str(e)}"
+
+@mcp.tool()
+def tool_find_action_items(ctx: Context, hours: int = 72) -> str:
+    """
+    Scan messages for action items and commitments you've made.
+    
+    This tool analyzes your sent messages to identify phrases that indicate
+    you've committed to doing something. It helps people with ADHD or busy
+    schedules keep track of promises they've made in conversations.
+    
+    The tool looks for phrases like "I'll", "I will", "I need to", etc.,
+    and organizes them by conversation with context.
+    
+    Args:
+        hours: Number of hours to look back (default: 72)
+    """
+    logger.info(f"Finding action items: hours={hours}")
+    try:
+        result = find_action_items(hours=hours)
+        return result
+    except Exception as e:
+        logger.error(f"Error finding action items: {str(e)}")
+        return f"Error finding action items: {str(e)}"
+
 @mcp.resource("messages://recent/{hours}")
 def get_recent_messages_resource(hours: int = 24) -> str:
     """Resource that provides recent messages."""
@@ -195,6 +329,31 @@ def get_recent_messages_resource(hours: int = 24) -> str:
 def get_contact_messages_resource(contact: str, hours: int = 24) -> str:
     """Resource that provides messages from a specific contact."""
     return get_recent_messages(hours=hours, contact=contact)
+
+@mcp.resource("messages://unread")
+def get_unread_messages_resource() -> str:
+    """Resource that provides all unread messages."""
+    return get_unread_messages()
+
+@mcp.resource("messages://unread/detailed")
+def get_unread_messages_detailed_resource() -> str:
+    """Resource that provides a detailed analysis of unread messages."""
+    return get_unread_messages_detailed()
+
+@mcp.resource("messages://response_times/{hours}")
+def get_response_times_resource(hours: int = 168) -> str:
+    """Resource that provides response time analysis."""
+    return analyze_response_times(hours=hours)
+
+@mcp.resource("messages://response_times/{contact}/{hours}")
+def get_response_times_contact_resource(contact: str, hours: int = 168) -> str:
+    """Resource that provides response time analysis for a specific contact."""
+    return analyze_response_times(hours=hours, contact=contact)
+
+@mcp.resource("messages://action_items/{hours}")
+def get_action_items_resource(hours: int = 72) -> str:
+    """Resource that provides action items and commitments from recent messages."""
+    return find_action_items(hours=hours)
 
 def run_server():
     """Run the MCP server with proper error handling"""
